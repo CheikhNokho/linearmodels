@@ -182,6 +182,7 @@ class PooledOLS(object):
                                                  DriscollKraay, ACCovariance)
         self._original_index = self.dependent.index.copy()
         self._validate_data()
+        self._singleton_index = None
 
     def __str__(self):
         out = '{name} \nNum exog: {num_exog}, Constant: {has_constant}'
@@ -550,6 +551,8 @@ class PooledOLS(object):
                 clusters[name] = group_ids
             else:
                 clusters = pd.DataFrame(group_ids)
+        if self._singleton_index is not None and clusters is not None:
+            clusters = clusters.loc(~self._singleton_index)
 
         cov_config_upd['clusters'] = np.asarray(clusters) if clusters is not None else clusters
 
@@ -712,6 +715,8 @@ class PanelOLS(PooledOLS):
     other_effects : array-like, optional
         Category codes to use for any effects that are not entity or time
         effects. Each variable is treated as an effect.
+    singletons : bool, optional
+        Flag indicating whether to drop singleton observation
 
     Notes
     -----
@@ -748,13 +753,63 @@ class PanelOLS(PooledOLS):
     """
 
     def __init__(self, dependent, exog, *, weights=None, entity_effects=False, time_effects=False,
-                 other_effects=None):
+                 other_effects=None, singletons=True):
         super(PanelOLS, self).__init__(dependent, exog, weights=weights)
 
         self._entity_effects = entity_effects
         self._time_effects = time_effects
         self._other_effect_cats = None
+        self._singletons = singletons
         self._other_effects = self._validate_effects(other_effects)
+        self._singleton_index = None
+        self._drop_singletons()
+
+    def _collect_effects(self):
+        effects = []
+        if self.entity_effects:
+            effects.append(np.asarray(self.dependent.entity_ids).squeeze())
+        if self.time_effects:
+            effects.append(np.asarray(self.dependent.time_ids).squeeze())
+        if self.other_effects:
+            other = self._other_effect_cats.dataframe
+            for col in other:
+                effects.append(np.asarray(other[col]).squeeze())
+        return effects
+
+    def _drop_singletons(self):
+        has_effects = self.entity_effects or self.time_effects or self.other_effects is not None
+        if self._singletons or not has_effects:
+            return
+        any_dropped = True  # Ensure runs onecs
+        nobs = self.dependent.dataframe.shape[0]
+        indices = np.arange(nobs)
+        # TODO: Can have 2 way singletons with 2 fixed effects?
+        # TODO: Correct solution appears to find closed graphs and
+        #       remove if length of graph = number of effects
+        # Iterate here to ensure that panel is free of simple singletons,
+        # which could be masked by other singletons
+        while any_dropped:
+            effects = self._collect_effects()
+            drop = np.zeros(indices.shape[0], dtype=np.bool)
+            for effect in effects:
+                effect = pd.Series(effect)
+                vc = effect.value_counts()
+                single = vc == 1
+                if np.any(single):
+                    drop |= effect.isin(vc[single].index).values
+            any_dropped = np.any(drop)
+            if np.any(drop):
+                self._singleton_index = drop
+                self.dependent.drop(drop)
+                self.exog.drop(drop)
+                self.weights.drop(drop)
+                if self.other_effects:
+                    self._other_effect_cats.drop(drop)
+                indices = indices[~drop]
+        if indices.shape[0] != nobs:
+            drop = np.ones(nobs, dtype=np.bool)
+            drop[indices] = True
+            self._singleton_index = drop
 
     def __str__(self):
         out = super(PanelOLS, self).__str__()
@@ -1154,7 +1209,7 @@ class PanelOLS(PooledOLS):
         * 'clustered` - One or two way clustering.  Configuration options are:
 
           * ``clusters`` - Input containing containing 1 or 2 variables.
-            Clusters should be integer values, although other types will
+            Clusters should be integer valued, although other types will
             be coerced to integer values by treating as categorical variables
           * ``cluster_entity`` - Boolean flag indicating to use entity
             clusters
@@ -1201,6 +1256,7 @@ class PanelOLS(PooledOLS):
         nobs = self.dependent.dataframe.shape[0]
         df_model = x.shape[1] + neffects
         df_resid = nobs - df_model
+        # Check clusters if singletons were removed
         cov_est, cov_config = self._choose_cov(cov_type, **cov_config)
         if auto_df:
             count_effects = self._determine_df_adjustment(cov_type, **cov_config)
